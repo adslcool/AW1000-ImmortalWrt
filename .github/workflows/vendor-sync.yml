@@ -1,0 +1,102 @@
+name: Sync Third-Party Vendor Sources
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aw1000-vendor-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Snapshot third-party repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf vendor/packages vendor/.tmp
+          mkdir -p vendor/.tmp/packages vendor/.tmp/repos
+
+          {
+            echo "# Third-party source snapshots"
+            echo "# Updated by .github/workflows/vendor-sync.yml"
+            echo "# Normal Build uses these repository-local snapshots first."
+            echo
+          } > vendor/VENDOR_COMMITS.txt
+
+          snapshot_repo() {
+            local name="$1"
+            local url="$2"
+            local tmp="vendor/.tmp/repos/$name"
+            local dest="vendor/.tmp/packages/$name"
+
+            echo "Syncing $name ..."
+            git clone --depth=1 --filter=blob:none "$url" "$tmp"
+            local commit
+            commit="$(git -C "$tmp" rev-parse HEAD)"
+
+            mkdir -p "$dest"
+            rsync -a --delete --exclude='.git/' "$tmp/" "$dest/"
+
+            printf '%-24s %s %s\n' "$name" "$commit" "$url" \
+              >> vendor/VENDOR_COMMITS.txt
+          }
+
+          snapshot_repo QModem https://github.com/FUjr/QModem.git
+          snapshot_repo luci-theme-argon https://github.com/jerrykuku/luci-theme-argon.git
+          snapshot_repo luci-app-aw1k-led https://github.com/nooblk-98/luci-app-aw1k-led.git
+
+          echo "Syncing luci-app-openclash ..."
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://github.com/vernesong/OpenClash.git vendor/.tmp/repos/OpenClash
+          git -C vendor/.tmp/repos/OpenClash sparse-checkout set luci-app-openclash
+          openclash_commit="$(git -C vendor/.tmp/repos/OpenClash rev-parse HEAD)"
+          mkdir -p vendor/.tmp/packages/luci-app-openclash
+          rsync -a --delete vendor/.tmp/repos/OpenClash/luci-app-openclash/ vendor/.tmp/packages/luci-app-openclash/
+          git -C vendor/.tmp/repos/OpenClash show HEAD:LICENSE \
+            > vendor/.tmp/packages/luci-app-openclash/LICENSE.upstream
+          printf '%-24s %s %s\n' "luci-app-openclash" "$openclash_commit" \
+            "https://github.com/vernesong/OpenClash.git" >> vendor/VENDOR_COMMITS.txt
+
+          echo "Creating deterministic web-upload-friendly Vendor archive ..."
+          tar --sort=name --mtime='UTC 1970-01-01' \
+            --owner=0 --group=0 --numeric-owner \
+            -cf - -C vendor/.tmp packages \
+            | gzip -n -9 > vendor/vendor-sources.tar.gz
+          (cd vendor && sha256sum vendor-sources.tar.gz > VENDOR_ARCHIVE.sha256)
+
+          cat vendor/VENDOR_COMMITS.txt
+          cat vendor/VENDOR_ARCHIVE.sha256
+          du -sh vendor/.tmp/packages/* vendor/vendor-sources.tar.gz || true
+          rm -rf vendor/.tmp vendor/packages
+
+      - name: Commit vendor snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # -A also removes a legacy unpacked vendor/packages tree. Only the
+          # compressed, checksummed snapshot is stored in the repository.
+          git add -A vendor
+
+          if git diff --cached --quiet; then
+            echo "Vendor snapshots are already up to date."
+            exit 0
+          fi
+
+          git commit -m "vendor: refresh third-party source snapshots"
+          git push
