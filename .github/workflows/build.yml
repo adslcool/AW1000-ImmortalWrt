@@ -1,0 +1,220 @@
+name: Build AW1000 ImmortalWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      immortalwrt_version:
+        description: "Official 25.12.X version (e.g. 25.12.2), or auto for newest 25.12.X"
+        required: true
+        default: "auto"
+        type: string
+      hostname:
+        description: "Router hostname"
+        required: true
+        default: "AW1000"
+        type: string
+      ssid_2g:
+        description: "2.4 GHz Wi-Fi SSID"
+        required: true
+        default: "AW1000-2G"
+        type: string
+      ssid_5g:
+        description: "5 GHz Wi-Fi SSID"
+        required: true
+        default: "AW1000-5G"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aw1000-build
+  cancel-in-progress: false
+
+env:
+  CCACHE_DIR: /home/runner/.ccache
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v5
+
+      - name: Validate build scripts and LED behavior
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Check required secrets
+        shell: bash
+        env:
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
+          WIFI_PASSWORD: ${{ secrets.WIFI_PASSWORD }}
+        run: |
+          set -e
+          [ -n "$ROOT_PASSWORD" ] || { echo "::error::Missing ROOT_PASSWORD repository secret"; exit 1; }
+          [ -n "$WIFI_PASSWORD" ] || { echo "::error::Missing WIFI_PASSWORD repository secret"; exit 1; }
+          [ "${#WIFI_PASSWORD}" -ge 8 ] || { echo "::error::WIFI_PASSWORD must be at least 8 characters"; exit 1; }
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget curl libelf-dev libglib2.0-dev \
+            libgmp3-dev libmpc-dev libmpfr-dev libreadline-dev libtool \
+            device-tree-compiler cpio cmake ninja-build patch pkgconf \
+            python3 python3-pip python3-ply python3-docutils \
+            qemu-utils squashfs-tools subversion texinfo uglifyjs \
+            p7zip-full xxd xmlto ccache
+
+      - name: Resolve latest stable ImmortalWrt
+        id: release
+        shell: bash
+        env:
+          IMMORTALWRT_REQUESTED_VERSION: ${{ inputs.immortalwrt_version }}
+        run: |
+          chmod +x scripts/resolve-immortalwrt-release.sh
+          ./scripts/resolve-immortalwrt-release.sh
+
+      - name: Clone exact stable ImmortalWrt source
+        shell: bash
+        env:
+          IMMORTALWRT_VERSION: ${{ steps.release.outputs.version }}
+          IMMORTALWRT_BRANCH: ${{ steps.release.outputs.branch }}
+          IMMORTALWRT_REVISION: ${{ steps.release.outputs.revision }}
+          IMMORTALWRT_COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --filter=blob:none \
+            --single-branch \
+            --branch "$IMMORTALWRT_BRANCH" \
+            --no-checkout \
+            https://github.com/immortalwrt/immortalwrt.git immortalwrt
+
+          cd immortalwrt
+          git cat-file -e "${IMMORTALWRT_COMMIT}^{commit}"
+          git checkout --detach "$IMMORTALWRT_COMMIT"
+
+          ACTUAL_REF="$(git rev-parse --short="${#IMMORTALWRT_COMMIT}" HEAD)"
+          test "$ACTUAL_REF" = "$IMMORTALWRT_COMMIT"
+
+          # openwrt_release gets DISTRIB_REVISION from scripts/getver.sh (%R),
+          # not CONFIG_VERSION_CODE. Pin it to the exact official release
+          # revision because this checkout is intentionally detached.
+          bash ../scripts/stamp-source-revision.sh "$PWD"
+
+          {
+            echo "ImmortalWrt stable release: $IMMORTALWRT_VERSION"
+            echo "Revision: $IMMORTALWRT_REVISION"
+            echo "Full commit: $(git rev-parse HEAD)"
+            echo "Branch used for history: $IMMORTALWRT_BRANCH"
+          } | tee ../IMMORTALWRT_COMMIT.txt
+
+          mkdir -p dl "$CCACHE_DIR"
+
+      - name: Restore download and compiler caches
+        uses: actions/cache@v5
+        with:
+          path: |
+            immortalwrt/dl
+            ~/.ccache
+          key: aw1000-${{ steps.release.outputs.version }}-${{ runner.os }}-${{ hashFiles('config/aw1000.config', 'scripts/**', 'config/version.config', 'patches/**', 'files-template/**', 'vendor/VENDOR_COMMITS.txt', 'vendor/VENDOR_ARCHIVE.sha256') }}
+          restore-keys: |
+            aw1000-${{ steps.release.outputs.version }}-${{ runner.os }}-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=3G
+          ccache --zero-stats || true
+
+      - name: Generate password hash
+        id: passwd
+        shell: bash
+        env:
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
+        run: |
+          HASH="$(openssl passwd -6 "$ROOT_PASSWORD")"
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare feeds, packages and fixed defaults
+        env:
+          ROOT_PASSWORD_HASH: ${{ steps.passwd.outputs.hash }}
+          WIFI_PASSWORD: ${{ secrets.WIFI_PASSWORD }}
+          HOSTNAME: ${{ inputs.hostname }}
+          SSID_2G: ${{ inputs.ssid_2g }}
+          SSID_5G: ${{ inputs.ssid_5g }}
+          IMMORTALWRT_VERSION: ${{ steps.release.outputs.version }}
+          IMMORTALWRT_REVISION: ${{ steps.release.outputs.revision }}
+        run: |
+          chmod +x scripts/prepare-source.sh
+          ./scripts/prepare-source.sh immortalwrt
+          bash scripts/check-led-control.sh immortalwrt
+
+      - name: Save final diffconfig
+        run: |
+          cd immortalwrt
+          ./scripts/diffconfig.sh > ../final.diffconfig
+          cat ../final.diffconfig
+
+      - name: Download source packages
+        run: |
+          cd immortalwrt
+          make download -j"$(nproc)" V=s
+          find dl -type f -size -1024c -print -delete || true
+
+      - name: Build firmware
+        run: |
+          cd immortalwrt
+          make -j"$(nproc)" V=s || make -j1 V=s
+
+      - name: Verify release rootfs and image manifest
+        shell: bash
+        env:
+          IMMORTALWRT_VERSION: ${{ steps.release.outputs.version }}
+          IMMORTALWRT_REVISION: ${{ steps.release.outputs.revision }}
+        run: bash scripts/check-release.sh immortalwrt image
+
+      - name: Show ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Verify no RG500 modem firmware is embedded
+        run: |
+          chmod +x scripts/check-no-modem-firmware.sh
+          ./scripts/check-no-modem-firmware.sh immortalwrt
+
+      - name: Collect firmware
+        shell: bash
+        run: |
+          set -e
+          mkdir -p output
+          cp build-manifest.json CHANGELOG.md output/
+          cp IMMORTALWRT_COMMIT.txt IMMORTALWRT_RELEASE_RESOLVED.txt IMMORTALWRT_FEEDS_RELEASE.txt final.diffconfig output/
+          [ -f CUSTOM_PACKAGE_COMMITS.txt ] && cp CUSTOM_PACKAGE_COMMITS.txt output/ || true
+          [ -f AUTO_ZH_CN_PACKAGES.txt ] && cp AUTO_ZH_CN_PACKAGES.txt output/ || true
+          find immortalwrt/bin/targets/qualcommax/ipq807x -maxdepth 1 -type f \
+            \( -name '*arcadyan_aw1000*' -o -name 'config.buildinfo' -o -name 'feeds.buildinfo' -o -name 'version.buildinfo' -o -name 'profiles.json' \) \
+            -exec cp -v {} output/ \;
+          (cd output && sha256sum * > sha256sums.txt)
+          ls -lh output
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: AW1000-ImmortalWrt-${{ steps.release.outputs.version }}-${{ github.run_number }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
