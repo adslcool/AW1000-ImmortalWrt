@@ -1,0 +1,154 @@
+#!/bin/sh
+# AW1000 custom first-boot defaults.
+
+HOSTNAME='@@HOSTNAME@@'
+SSID_2G='@@SSID_2G@@'
+SSID_5G='@@SSID_5G@@'
+LAN_IP='@@LAN_IP@@'
+LAN_NETMASK='@@LAN_NETMASK@@'
+DHCP_START_OFFSET='@@DHCP_START_OFFSET@@'
+DHCP_LIMIT='@@DHCP_LIMIT@@'
+WAN_PROTO='@@WAN_PROTO@@'
+WIFI_PASSWORD='@@WIFI_PASSWORD@@'
+WIFI_COUNTRY='@@WIFI_COUNTRY@@'
+ZONENAME='@@ZONENAME@@'
+TIMEZONE='@@TIMEZONE@@'
+ROOT_PASSWORD_HASH='@@ROOT_PASSWORD_HASH@@'
+
+if [ -n "$ROOT_PASSWORD_HASH" ]; then
+    sed -i "s#^root:[^:]*:#root:${ROOT_PASSWORD_HASH}:#" /etc/shadow
+fi
+
+uci -q set system.@system[0].hostname="$HOSTNAME"
+uci -q set system.@system[0].zonename="$ZONENAME"
+uci -q set system.@system[0].timezone="$TIMEZONE"
+
+uci -q set network.lan.ipaddr="$LAN_IP"
+uci -q set network.lan.netmask="$LAN_NETMASK"
+uci -q set dhcp.lan.start="$DHCP_START_OFFSET"
+uci -q set dhcp.lan.limit="$DHCP_LIMIT"
+uci -q set dhcp.lan.leasetime='12h'
+
+# AW1000: LAN1-LAN4 form br-lan; physical fifth/2.5G Ethernet port is wired WAN.
+BRSEC=""
+for sec in $(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)=device$/\1/p"); do
+    [ "$(uci -q get network.${sec}.name)" = 'br-lan' ] && BRSEC="$sec" && break
+done
+if [ -n "$BRSEC" ]; then
+    uci -q delete network.${BRSEC}.ports
+    uci -q add_list network.${BRSEC}.ports='lan1'
+    uci -q add_list network.${BRSEC}.ports='lan2'
+    uci -q add_list network.${BRSEC}.ports='lan3'
+    uci -q add_list network.${BRSEC}.ports='lan4'
+fi
+
+uci -q set network.wan.device='wan'
+uci -q set network.wan.proto="$WAN_PROTO"
+uci -q set network.wan.metric='10'
+uci -q set network.wan.peerdns='0'
+uci -q delete network.wan.dns
+uci -q add_list network.wan.dns='223.5.5.5'
+uci -q add_list network.wan.dns='119.29.29.29'
+
+uci -q set network.wan6.proto='dhcpv6'
+uci -q set network.wan6.device='@wan'
+uci -q set network.wan6.metric='10'
+
+# The same logical "wan" section can later be changed in LuCI from DHCP to
+# PPPoE. The failover service resolves network.interface.wan -> l3_device at
+# runtime, so no failover reconfiguration is needed when protocol changes.
+
+# No NSS/TurboACC and no flow-offload by default.
+uci -q set firewall.@defaults[0].flow_offloading='0'
+uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+
+# 2.4 GHz and 5 GHz use separate SSIDs; both use the configured Wi-Fi password.
+for dev in $(uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)=wifi-device$/\1/p"); do
+    band="$(uci -q get wireless.${dev}.band)"
+    uci -q set wireless.${dev}.country="$WIFI_COUNTRY"
+    uci -q set wireless.${dev}.disabled='0'
+    case "$band" in
+        2g)
+            uci -q set wireless.${dev}.channel='1'
+            uci -q set wireless.${dev}.htmode='HE20'
+            ;;
+        5g)
+            uci -q set wireless.${dev}.channel='149'
+            uci -q set wireless.${dev}.htmode='HE80'
+            ;;
+    esac
+done
+
+for iface in $(uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)=wifi-iface$/\1/p"); do
+    dev="$(uci -q get wireless.${iface}.device)"
+    band="$(uci -q get wireless.${dev}.band)"
+    case "$band" in
+        2g) uci -q set wireless.${iface}.ssid="$SSID_2G" ;;
+        5g) uci -q set wireless.${iface}.ssid="$SSID_5G" ;;
+    esac
+    uci -q set wireless.${iface}.encryption='sae-mixed'
+    uci -q set wireless.${iface}.key="$WIFI_PASSWORD"
+    uci -q set wireless.${iface}.disabled='0'
+    uci -q set wireless.${iface}.ieee80211k='1'
+    uci -q set wireless.${iface}.bss_transition='1'
+    uci -q set wireless.${iface}.ieee80211r='0'
+done
+
+uci -q set luci.main.lang='zh_cn'
+uci -q set luci.main.mediaurlbase='/luci-static/argon'
+
+sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+
+uci commit system
+uci commit network
+uci commit dhcp
+uci commit firewall
+uci commit wireless
+uci commit luci
+
+
+# ------------------------------------------------------------------
+# AW1000 modem defaults: the built-in RG500Q-EA has been confirmed on
+# this device as USB 2c7c:0800 using qmi_wwan_q / QMAP.
+# Keep it dialed as a hot-standby so failover does not wait for dialing.
+# ------------------------------------------------------------------
+[ -f /etc/config/qmodem ] || touch /etc/config/qmodem
+uci -q set qmodem.main='main'
+uci -q set qmodem.main.enable_dial='1'
+uci -q set qmodem.main.try_preset_usb='1'
+uci -q set qmodem.main.enable_usb_scan='1'
+uci -q set qmodem.main.start_delay='25'
+
+# This AW1000 uses USB for RG500Q-EA; skip PCIe probing for this profile.
+uci -q set qmodem.main.try_preset_pcie='0'
+uci -q set qmodem.main.enable_pcie_scan='0'
+uci -q commit qmodem
+
+# ------------------------------------------------------------------
+# AW1000 LED defaults.
+# luci-app-aw1k-led owns the signal/SINR colors and thresholds.
+# We explicitly enable the service and keep Night Mode OFF by default.
+# ------------------------------------------------------------------
+if [ -f /etc/config/ledstatus ]; then
+    uci show ledstatus 2>/dev/null | sed -n 's/^\([^=]*\)=.*/\1/p' | while IFS= read -r key; do
+        case "$key" in
+            *night*.*enable|*night*.*enabled|*night*.*night_mode|*night*.*nightmode|*night_mode*|*nightmode*)
+                uci -q set "${key}=0" || true
+                ;;
+        esac
+    done
+    uci -q commit ledstatus
+fi
+
+
+[ -x /etc/init.d/zerotier ] && /etc/init.d/zerotier disable >/dev/null 2>&1
+[ -x /etc/init.d/ttyd ] && /etc/init.d/ttyd disable >/dev/null 2>&1
+[ -x /etc/init.d/qmodem ] && /etc/init.d/qmodem enable >/dev/null 2>&1
+[ -x /etc/init.d/ledstatus ] && /etc/init.d/ledstatus enable >/dev/null 2>&1
+[ -x /etc/init.d/aw1000-5g-role-led ] && /etc/init.d/aw1000-5g-role-led enable >/dev/null 2>&1
+[ -x /etc/init.d/watchcat ] && /etc/init.d/watchcat disable >/dev/null 2>&1
+[ -x /etc/init.d/watchcat ] && /etc/init.d/watchcat stop >/dev/null 2>&1 || true
+[ -x /etc/init.d/aw1000-failover ] && /etc/init.d/aw1000-failover enable >/dev/null 2>&1
+
+exit 0

@@ -1,0 +1,7 @@
+# Actual third-party source snapshots bundled on 2026-09-20
+# Normal Build uses these local snapshots. Manual Vendor Sync updates them.
+
+QModem                   c49654efc870f53712ee8e25bf181722eb1466d9 https://github.com/FUjr/QModem.git
+luci-theme-argon         182294b07f985088b40610f80ec867fe167e41db https://github.com/jerrykuku/luci-theme-argon.git
+luci-app-aw1k-led        a8e3537366d74958fbc31046a762769918a4651f https://github.com/nooblk-98/luci-app-aw1k-led.git
+luci-app-openclash       c3a33c1d3407956fdf8f0e0b7c1a4c52e6ad9593 https://github.com/vernesong/OpenClash.git

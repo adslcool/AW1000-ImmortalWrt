@@ -1,0 +1,47 @@
+#!/bin/sh
+# Ensure QModem-created logical interfaces whose L3 netdev is wwan*
+# are members of the firewall "wan" zone so LAN -> 5G NAT/forwarding works.
+
+case "$ACTION" in
+    ifup|update|ifupdate|connected)
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+[ -n "$INTERFACE" ] || exit 0
+
+l3dev="$(ubus call "network.interface.${INTERFACE}" status 2>/dev/null \
+    | jsonfilter -e '@.l3_device' 2>/dev/null)"
+
+case "$l3dev" in
+    wwan*)
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+zone_idx=""
+i=0
+while uci -q get "firewall.@zone[$i]" >/dev/null 2>&1; do
+    name="$(uci -q get "firewall.@zone[$i].name")"
+    if [ "$name" = "wan" ]; then
+        zone_idx="$i"
+        break
+    fi
+    i=$((i + 1))
+done
+
+[ -n "$zone_idx" ] || exit 0
+
+networks="$(uci -q get "firewall.@zone[$zone_idx].network" 2>/dev/null)"
+if ! printf '%s\n' "$networks" | tr ' ' '\n' | grep -Fxq "$INTERFACE"; then
+    uci -q add_list "firewall.@zone[$zone_idx].network=$INTERFACE"
+    uci -q commit firewall
+    /etc/init.d/firewall reload >/dev/null 2>&1 || true
+    logger -t aw1000-failover "added cellular interface ${INTERFACE} (${l3dev}) to firewall wan zone"
+fi
+
+exit 0

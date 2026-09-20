@@ -1,0 +1,19 @@
+#!/bin/sh
+# Read-only diagnostics. No AT commands, probes or LED writes.
+echo 'AW1000 5G role controller'
+/usr/sbin/aw1000-5g-role-led status
+echo
+echo 'Failover health snapshot'
+/usr/sbin/aw1000-failover status
+echo
+echo 'LED service state'
+for service in aw1000-failover aw1000-5g-role-led ledstatus; do
+    if /etc/init.d/"$service" running >/dev/null 2>&1; then
+        echo "$service=running"
+    else
+        echo "$service=stopped"
+    fi
+done
+echo
+echo 'Recent role changes'
+logread -e aw1000-5g-role-led | tail -n 20

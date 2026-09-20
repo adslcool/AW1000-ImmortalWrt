@@ -1,0 +1,65 @@
+#!/bin/sh
+# AW1000/QModem SMS diagnostics. Read-only: it does NOT send SMS and does not
+# change modem configuration.
+
+echo "=== AW1000 QModem SMS diagnostics ==="
+date
+echo
+
+echo "## Installed packages"
+opkg list-installed 2>/dev/null | grep -E '^(qmodem|qmodem-smsd|sms-forwarder-next|luci-app-qmodem-next|ubus-at-daemon|tom_modem)' || true
+echo
+
+echo "## UBUS objects"
+ubus -v list qmodem_sms 2>/dev/null || echo "qmodem_sms ubus object: NOT FOUND"
+ubus -v list at-daemon 2>/dev/null || echo "at-daemon ubus object: NOT FOUND"
+echo
+
+echo "## QModem UCI (phone/SIM identifiers are not printed intentionally)"
+uci show qmodem 2>/dev/null | \
+    grep -Ev '(imei|imsi|iccid|pin|password|passwd|username|phone|number)=' || true
+echo
+
+echo "## SMS forwarder UCI (tokens/URLs redacted)"
+uci show sms_forwarder 2>/dev/null | \
+    sed -E "s/(token|key|url|secret|password|passwd)='[^']*'/\1='***REDACTED***'/Ig" || true
+echo
+
+echo "## Serial ports"
+ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || true
+echo
+
+echo "## Candidate QModem AT ports from UCI"
+AT_PORTS="$(
+    uci show qmodem 2>/dev/null | \
+    sed -n "s/^[^=]*\.\(at_port\|atport\|port\)='\([^']*tty[^']*\)'$/\2/p" | sort -u
+)"
+if [ -z "$AT_PORTS" ]; then
+    AT_PORTS="$(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -n 8)"
+fi
+printf '%s\n' "$AT_PORTS"
+echo
+
+if ubus -v list at-daemon >/dev/null 2>&1; then
+    for port in $AT_PORTS; do
+        [ -c "$port" ] || continue
+        echo "## AT diagnostics on $port"
+        for cmd in 'AT' 'AT+CPIN?' 'AT+CEREG?' 'AT+CSCA?' 'AT+CMGF?' 'AT+CPMS?'; do
+            echo "-- $cmd"
+            ubus call at-daemon sendat "{\"at_port\":\"$port\",\"at_cmd\":\"$cmd\",\"timeout\":5}" 2>/dev/null || true
+        done
+        echo
+    done
+else
+    echo "at-daemon is unavailable; skipping AT queries."
+fi
+
+echo "## Relevant recent logs"
+logread 2>/dev/null | grep -Ei 'qmodem|qmodem_sms|smsd|sms_forward|sms-forward|at-daemon|CMS ERROR|CME ERROR|CMGS' | tail -n 160 || true
+echo
+
+echo "## Notes"
+echo "1. qmodem-smsd handles SIM SMS send/receive."
+echo "2. sms-forwarder-next forwards received SMS to configured external services."
+echo "3. For a send failure, note any +CMS ERROR code and AT+CSCA? result."
+echo "4. Test a short SMS first; upstream QModem Next has separate multipart behavior."

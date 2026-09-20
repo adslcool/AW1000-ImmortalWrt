@@ -1,0 +1,153 @@
+#!/bin/sh
+# Only this controller owns *:5g while enabled; ledstatus retains other LEDs.
+LED_ROOT="${AW1000_LED_ROOT:-/sys/class/leds}"
+STATE_FILE="${AW1000_FAILOVER_STATE:-/tmp/aw1000-failover.status}"
+LED_STATE="${AW1000_LED_STATE:-/tmp/aw1000-5g-role-led.status}"
+NIGHT_FLAG="${AW1000_NIGHT_FLAG:-/tmp/led-night-active}"
+CFG='aw1000-5g-role-led'
+
+cfg() { uci -q get "$CFG.main.$1" 2>/dev/null; }
+value() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1; }
+number() {
+    case "$1" in ''|*[!0-9]*) printf '%s\n' "$2";; *)
+        if [ "$1" -gt 0 ] && [ "$1" -le 86400 ]; then printf '%s\n' "$1"; else printf '%s\n' "$2"; fi;;
+    esac
+}
+color_for() {
+    local color
+    color="$(cfg "${1}_color")"
+    case "$color" in red|green|blue|yellow|cyan|magenta|white|off) printf '%s\n' "$color";;
+        *) case "$1" in standby) echo blue;; active) echo green;; transition) echo yellow;; error) echo red;; *) echo off;; esac;;
+    esac
+}
+night_active() {
+    [ "$(cfg respect_night_mode)" != '0' ] || return 1
+    [ -f "$NIGHT_FLAG" ] && return 0
+    [ "$(uci -q get ledstatus.settings.night_enabled)" = '1' ] || return 1
+    local start end now
+    start="$(uci -q get ledstatus.settings.night_start)"
+    end="$(uci -q get ledstatus.settings.night_end)"
+    now="$(date +%H:%M)"
+    awk -v s="$start" -v e="$end" -v n="$now" 'BEGIN {
+        if (s !~ /^[0-9][0-9]?:[0-9][0-9]$/ || e !~ /^[0-9][0-9]?:[0-9][0-9]$/) exit 1;
+        split(s,a,":"); split(e,b,":"); split(n,c,":");
+        if (a[1]>23 || b[1]>23 || a[2]>59 || b[2]>59) exit 1;
+        s=a[1]*60+a[2]; e=b[1]*60+b[2]; n=c[1]*60+c[2];
+        if (s==e) exit 1;
+        exit !((s<e && n>=s && n<e) || (s>e && (n>=s || n<e)));
+    }'
+}
+set_rgb() {
+    local channel led current target max lit failed=0
+    # Do not clear the whole RGB before setting an unchanged color.
+    for channel in red green blue; do
+        led="$LED_ROOT/$channel:5g"
+        [ -w "$led/brightness" ] && [ -w "$led/trigger" ] || { failed=1; continue; }
+        current="$(cat "$led/trigger" 2>/dev/null)"
+        case "$current" in none|*'[none]'*) ;; *) printf '%s\n' none > "$led/trigger" || failed=1;; esac
+        max="$(number "$(cat "$led/max_brightness" 2>/dev/null)" 1)"
+        lit=0
+        case "$channel:$1" in
+            red:red|red:yellow|red:magenta|red:white|green:green|green:yellow|green:cyan|green:white|blue:blue|blue:cyan|blue:magenta|blue:white) lit=1;;
+        esac
+        target=$((max * lit))
+        current="$(cat "$led/brightness" 2>/dev/null)"
+        [ "$current" = "$target" ] || printf '%s\n' "$target" > "$led/brightness" || failed=1
+    done
+    [ "$failed" -eq 0 ]
+}
+apply_once() {
+    local previous sample id last_id role previous_role display color state route healthy
+    local failures recoveries threshold recovery_threshold now sampled age stale reason fresh night hw
+    previous="$(cat "$LED_STATE" 2>/dev/null)"
+    # Read one atomic snapshot; never source/eval the status file.
+    sample="$(cat "$STATE_FILE" 2>/dev/null)"
+    previous_role="$(value "$previous" stable_role)"
+    case "$previous_role" in active|standby|transition|error|unavailable) role="$previous_role";; *) role=unavailable;; esac
+    failures="$(value "$previous" failure_count)"; failures="${failures:-0}"
+    recoveries="$(value "$previous" recovery_count)"; recoveries="${recoveries:-0}"
+    case "$failures:$recoveries" in *[!0-9:]*|:*) failures=0; recoveries=0;; esac
+    threshold="$(number "$(cfg error_threshold)" 3)"
+    recovery_threshold="$(number "$(cfg recovery_threshold)" 2)"
+    stale="$(number "$(cfg stale_after)" 120)"
+    id="$(value "$sample" sample_id)"
+    last_id="$(value "$previous" last_sample_id)"
+    state="$(value "$sample" state)"
+    route="$(value "$sample" cellular_route_available)"
+    healthy="$(value "$sample" cellular_internet_healthy)"
+    sampled="$(value "$sample" updated_uptime)"
+    now="$(cut -d. -f1 /proc/uptime)"
+    fresh=1; reason=ok
+    case "$sampled" in ''|*[!0-9]*) fresh=0;; *)
+        age=$((now - sampled)); [ "$age" -ge 0 ] && [ "$age" -le "$stale" ] || fresh=0;;
+    esac
+    case "$state:$route:$healthy" in wired:[01]:[01]|cellular:[01]:[01]) ;; *) fresh=0;; esac
+    [ -n "$id" ] || fresh=0
+    if [ "$fresh" -eq 0 ]; then
+        reason=missing_or_stale_status
+        role=unavailable; failures=0; recoveries=0; last_id=''
+    elif [ "$id" != "$last_id" ]; then
+        last_id="$id"
+        if [ "$route" = '0' ]; then
+            role=unavailable; failures=0; recoveries=0
+            reason=no_cellular_route
+        elif [ "$healthy" = '0' ]; then
+            recoveries=0
+            [ "$failures" -ge "$threshold" ] || failures=$((failures + 1))
+            reason=cellular_probe_failed
+            [ "$failures" -lt "$threshold" ] || role=error
+        else
+            failures=0
+            [ "$recoveries" -ge "$recovery_threshold" ] || recoveries=$((recoveries + 1))
+            if [ "$role" != error ] || [ "$recoveries" -ge "$recovery_threshold" ]; then
+                case "$state" in wired) role=standby;; cellular) role=active;; esac
+                case "$(value "$sample" wired_fail_count):$(value "$sample" wired_recover_count)" in
+                    0:0) ;; *[!0-9:]*|:*) ;; *) role=transition;;
+                esac
+            fi
+        fi
+    else
+        reason="$(value "$previous" reason)"
+    fi
+    display="$role"; color="$(color_for "$role")"; night=0
+    if night_active; then display=night; color=off; night=1; fi
+    if [ "$(cfg enabled)" = '0' ]; then
+        display=disabled; color=unmanaged; hw=unmanaged
+    elif set_rgb "$color"; then hw=ok; else hw=missing_or_unwritable; fi
+    {
+        echo "role=$display"
+        echo "stable_role=$role"
+        echo "color=$color"
+        echo "failure_count=$failures"
+        echo "recovery_count=$recoveries"
+        echo "last_sample_id=$last_id"
+        echo "status_fresh=$fresh"
+        echo "reason=$reason"
+        echo "night_mode_active=$night"
+        echo "hardware=$hw"
+        echo "updated_uptime=$now"
+    } > "$LED_STATE.$$" && mv -f "$LED_STATE.$$" "$LED_STATE"
+    if [ "$(value "$previous" role):$(value "$previous" color):$(value "$previous" hardware)" != "$display:$color:$hw" ]; then
+        logger -t aw1000-5g-role-led "role=$display color=$color hardware=$hw reason=$reason"
+    fi
+}
+status() {
+    if [ -f "$LED_STATE" ]; then cat "$LED_STATE"; else echo 'role=not_started'; fi
+    local channel led
+    for channel in red green blue; do
+        led="$LED_ROOT/$channel:5g"
+        printf '%s_trigger=%s\n' "$channel" "$(cat "$led/trigger" 2>/dev/null || echo missing)"
+        printf '%s_brightness=%s\n' "$channel" "$(cat "$led/brightness" 2>/dev/null || echo missing)"
+    done
+}
+case "${1:-daemon}" in
+    daemon)
+        trap 'rm -f "$LED_STATE.$$"; exit 0' INT TERM
+        while [ "$(cfg enabled)" != '0' ]; do
+            apply_once
+            sleep "$(number "$(cfg poll_interval)" 2)" & wait "$!"
+        done;;
+    apply) apply_once;;
+    status) status;;
+    *) echo "Usage: $0 {daemon|apply|status}" >&2; exit 2;;
+esac

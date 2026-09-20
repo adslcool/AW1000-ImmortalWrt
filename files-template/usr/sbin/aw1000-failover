@@ -1,0 +1,396 @@
+#!/bin/sh
+# AW1000 wired-first failover controller.
+#
+# Policy:
+#   wired WAN healthy  -> wired metric 10, cellular metric 50
+#   wired WAN unhealthy -> wired metric 500, cellular metric 50
+#   wired WAN recovered -> wired metric 10 again
+#
+# The wired logical interface is "wan". netifd resolves its current L3 device,
+# so the same logic works with DHCP (usually device "wan") and PPPoE
+# (usually device "pppoe-wan").
+#
+# Cellular routes are discovered by kernel netdev name (wwan*), matching the
+# RG500Q-EA + qmi_wwan_q/QMAP topology confirmed on AW1000.
+
+CFG="aw1000-failover"
+STATE_FILE="${AW1000_FAILOVER_STATE:-/tmp/aw1000-failover.status}"
+STATUS_SEQUENCE=0
+TAG="aw1000-failover"
+
+log()
+{
+    logger -t "$TAG" "$*"
+}
+
+cfg_get()
+{
+    uci -q get "${CFG}.main.$1"
+}
+
+enabled()
+{
+    [ "$(cfg_get enabled)" != "0" ]
+}
+
+wired_iface()
+{
+    local x
+    x="$(cfg_get wired_interface)"
+    printf '%s\n' "${x:-wan}"
+}
+
+get_l3_device()
+{
+    local iface="$1"
+    ubus call "network.interface.${iface}" status 2>/dev/null \
+        | jsonfilter -e '@.l3_device' 2>/dev/null
+}
+
+iface_up()
+{
+    local iface="$1"
+    [ "$(ubus call "network.interface.${iface}" status 2>/dev/null \
+        | jsonfilter -e '@.up' 2>/dev/null)" = "true" ]
+}
+
+route_devs_v4()
+{
+    ip -4 route show default 2>/dev/null \
+        | awk '{
+            for (i=1; i<=NF; i++) {
+                if ($i == "dev" && (i+1) <= NF) {
+                    print $(i+1)
+                    break
+                }
+            }
+        }' | sort -u
+}
+
+route_devs_v6()
+{
+    ip -6 route show default 2>/dev/null \
+        | awk '{
+            for (i=1; i<=NF; i++) {
+                if ($i == "dev" && (i+1) <= NF) {
+                    print $(i+1)
+                    break
+                }
+            }
+        }' | sort -u
+}
+
+cellular_route_devs()
+{
+    {
+        route_devs_v4
+        route_devs_v6
+    } | awk '/^wwan[0-9A-Za-z_.:-]*$/ {print}' | sort -u
+}
+
+replace_route_metric()
+{
+    local family="$1"
+    local dev="$2"
+    local metric="$3"
+    local route base
+
+    ip "$family" route show default dev "$dev" 2>/dev/null | while IFS= read -r route; do
+        [ -n "$route" ] || continue
+
+        # Strip an existing "metric N" pair and preserve the rest of the
+        # kernel-provided route (gateway, src, proto, mtu, etc.).
+        base="$(printf '%s\n' "$route" | awk '
+            {
+                out=""
+                for (i=1; i<=NF; i++) {
+                    if ($i == "metric" && (i+1) <= NF) {
+                        i++
+                        continue
+                    }
+                    if (out == "") out=$i
+                    else out=out " " $i
+                }
+                print out
+            }'
+        )"
+
+        [ -n "$base" ] || continue
+        # shellcheck disable=SC2086
+        ip "$family" route replace $base metric "$metric" >/dev/null 2>&1 || true
+    done
+}
+
+set_dev_metric()
+{
+    local dev="$1"
+    local metric="$2"
+    [ -n "$dev" ] || return 0
+    replace_route_metric -4 "$dev" "$metric"
+    replace_route_metric -6 "$dev" "$metric"
+}
+
+normalize_cellular_metric()
+{
+    local metric dev
+    metric="$(cfg_get cellular_metric)"
+    metric="${metric:-50}"
+
+    for dev in $(cellular_route_devs); do
+        set_dev_metric "$dev" "$metric"
+    done
+}
+
+apply_wired_state()
+{
+    local state="$1"
+    local dev metric
+
+    dev="$(get_l3_device "$(wired_iface)")"
+    [ -n "$dev" ] || return 0
+
+    case "$state" in
+        wired)
+            metric="$(cfg_get wired_metric)"
+            metric="${metric:-10}"
+            ;;
+        cellular)
+            metric="$(cfg_get failed_wired_metric)"
+            metric="${metric:-500}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    set_dev_metric "$dev" "$metric"
+    normalize_cellular_metric
+}
+
+health_wired()
+{
+    local iface dev timeout reliability target ok total
+    iface="$(wired_iface)"
+
+    iface_up "$iface" || return 1
+
+    dev="$(get_l3_device "$iface")"
+    [ -n "$dev" ] || return 1
+    ip link show dev "$dev" >/dev/null 2>&1 || return 1
+
+    # There must be an IPv4 default route through the wired L3 device.
+    ip -4 route show default dev "$dev" 2>/dev/null | grep -q '^default' || return 1
+
+    timeout="$(cfg_get ping_timeout)"
+    timeout="${timeout:-2}"
+    reliability="$(cfg_get reliability)"
+    reliability="${reliability:-2}"
+
+    ok=0
+    total=0
+    for target in $(uci -q get "${CFG}.main.track_ip"); do
+        total=$((total + 1))
+        if ping -4 -I "$dev" -c 1 -W "$timeout" "$target" >/dev/null 2>&1; then
+            ok=$((ok + 1))
+        fi
+        [ "$ok" -ge "$reliability" ] && return 0
+    done
+
+    [ "$total" -gt 0 ] && [ "$ok" -ge "$reliability" ]
+}
+
+cellular_available()
+{
+    local dev
+    for dev in $(cellular_route_devs); do
+        ip link show dev "$dev" 2>/dev/null | grep -q 'UP' || continue
+        ip -4 route show default dev "$dev" 2>/dev/null | grep -q '^default' && return 0
+    done
+    return 1
+}
+
+health_cellular()
+{
+    local dev target timeout
+    timeout="$(cfg_get ping_timeout)"
+    timeout="${timeout:-2}"
+
+    # A WWAN default route alone is not enough. Confirm that at least one
+    # public target is actually reachable through a cellular wwan* device.
+    for dev in $(cellular_route_devs); do
+        ip link show dev "$dev" 2>/dev/null | grep -q 'UP' || continue
+        ip -4 route show default dev "$dev" 2>/dev/null | grep -q '^default' || continue
+
+        for target in $(uci -q get "${CFG}.main.track_ip"); do
+            if ping -4 -I "$dev" -c 1 -W "$timeout" "$target" >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+write_status()
+{
+    local state="$1"
+    local fail_count="$2"
+    local recover_count="$3"
+    local wif wdev cellular route_ok=0 health_ok=0 uptime
+
+    wif="$(wired_iface)"
+    wdev="$(get_l3_device "$wif")"
+    cellular="$(cellular_route_devs | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+
+    cellular_available && route_ok=1
+    health_cellular && health_ok=1
+    STATUS_SEQUENCE=$((STATUS_SEQUENCE + 1))
+    uptime="$(cut -d. -f1 /proc/uptime)"
+    {
+        echo "sample_id=$$-$STATUS_SEQUENCE"
+        echo "updated_uptime=$uptime"
+        echo "state=$state"
+        echo "wired_interface=$wif"
+        echo "wired_device=${wdev:-none}"
+        echo "cellular_devices=${cellular:-none}"
+        echo "wired_fail_count=$fail_count"
+        echo "wired_recover_count=$recover_count"
+        echo "cellular_route_available=$route_ok"
+        echo "cellular_internet_healthy=$health_ok"
+        echo "updated=$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$STATE_FILE.$$" && mv -f "$STATE_FILE.$$" "$STATE_FILE"
+}
+
+run_daemon()
+{
+    local interval fail_threshold recover_threshold
+    local state fail_count recover_count
+
+    trap 'rm -f "$STATE_FILE.$$"; exit 0' INT TERM
+    enabled || {
+        log "disabled by UCI"
+        exit 0
+    }
+
+    interval="$(cfg_get check_interval)"
+    interval="${interval:-5}"
+    fail_threshold="$(cfg_get fail_threshold)"
+    fail_threshold="${fail_threshold:-3}"
+    recover_threshold="$(cfg_get recover_threshold)"
+    recover_threshold="${recover_threshold:-3}"
+
+    state="wired"
+    fail_count=0
+    recover_count=0
+
+    # Make wired preferred immediately. If connectivity is bad, hysteresis below
+    # will move it behind cellular after the configured failure threshold.
+    apply_wired_state wired
+    write_status "$state" "$fail_count" "$recover_count"
+    log "started: wired-first, interval=${interval}s, fail=${fail_threshold}, recover=${recover_threshold}"
+
+    while true; do
+        normalize_cellular_metric
+
+        if health_wired; then
+            fail_count=0
+
+            if [ "$state" = "cellular" ]; then
+                recover_count=$((recover_count + 1))
+                if [ "$recover_count" -ge "$recover_threshold" ]; then
+                    state="wired"
+                    recover_count=0
+                    apply_wired_state wired
+                    log "wired Internet recovered; switched primary route back to wired WAN"
+                else
+                    # Keep wired de-preferred until recovery hysteresis is met.
+                    apply_wired_state cellular
+                fi
+            else
+                recover_count=0
+                apply_wired_state wired
+            fi
+        else
+            recover_count=0
+
+            if [ "$state" = "wired" ]; then
+                fail_count=$((fail_count + 1))
+                if [ "$fail_count" -ge "$fail_threshold" ]; then
+                    state="cellular"
+                    fail_count=0
+                    apply_wired_state cellular
+                    if health_cellular; then
+                        log "wired Internet failed; 5G health check passed; switched primary route to 5G cellular"
+                    elif cellular_available; then
+                        log "wired Internet failed; 5G route exists but cellular Internet health check failed"
+                    else
+                        log "wired Internet failed; 5G cellular default route is not currently available"
+                    fi
+                else
+                    apply_wired_state wired
+                fi
+            else
+                fail_count=0
+                apply_wired_state cellular
+            fi
+        fi
+
+        write_status "$state" "$fail_count" "$recover_count"
+        sleep "$interval"
+    done
+}
+
+enforce()
+{
+    local state
+
+    if [ -f "$STATE_FILE" ]; then
+        state="$(sed -n 's/^state=//p' "$STATE_FILE" | head -n 1)"
+    fi
+
+    case "$state" in
+        cellular)
+            apply_wired_state cellular
+            ;;
+        wired|*)
+            apply_wired_state wired
+            ;;
+    esac
+
+    normalize_cellular_metric
+}
+
+status()
+{
+    if [ -f "$STATE_FILE" ]; then
+        cat "$STATE_FILE"
+    else
+        echo "state=unknown"
+        echo "message=service has not written status yet"
+    fi
+}
+
+case "${1:-daemon}" in
+    daemon)
+        run_daemon
+        ;;
+    status)
+        status
+        ;;
+    check)
+        if health_wired; then
+            echo "wired=online"
+            exit 0
+        else
+            echo "wired=offline"
+            exit 1
+        fi
+        ;;
+    enforce)
+        enforce
+        ;;
+    *)
+        echo "Usage: $0 {daemon|status|check|enforce}" >&2
+        exit 2
+        ;;
+esac

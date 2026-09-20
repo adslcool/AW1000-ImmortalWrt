@@ -1,0 +1,18 @@
+#!/bin/sh
+# Reserve only the 5G RGB channels. Preserve other LED triggers.
+[ "$(uci -q get aw1000-5g-role-led.main.enabled)" = '0' ] && exit 0
+for section in $(uci -q show system | sed -n 's/^system\.\([^=]*\)=led$/\1/p'); do
+    case "$(uci -q get "system.$section.sysfs")" in
+        red:5g|green:5g|blue:5g)
+            uci -q set "system.$section.trigger=none"
+            uci -q set "system.$section.default=0"
+            ;;
+    esac
+done
+uci -q commit system
+for color in red green blue; do
+    led="/sys/class/leds/$color:5g"
+    [ ! -w "$led/trigger" ] || printf '%s\n' none > "$led/trigger"
+    [ ! -w "$led/brightness" ] || printf '%s\n' 0 > "$led/brightness"
+done
+exit 0

@@ -1,0 +1,89 @@
+{
+  "product": "Arcadyan AW1000",
+  "firmware_line": "v10.5.1-LTS-Build-Fix-v8.2",
+  "immortalwrt_policy": "auto-or-explicit-official-25.12.X-release-supporting-AW1000",
+  "openclash": "included-ui-runtime-core-on-demand",
+  "excluded": [
+    "luci-app-ssr-plus",
+    "xray-core",
+    "passwall",
+    "passwall2",
+    "embedded-mihomo-core"
+  ],
+  "modem": "Quectel RG500Q-EA USB 2c7c:0800",
+  "at_port_preference": "/dev/ttyUSB3",
+  "version": "v10.5.1-fix8.2",
+  "workflow_inputs": [
+    "immortalwrt_version",
+    "hostname",
+    "ssid_2g",
+    "ssid_5g"
+  ],
+  "source_policy": {
+    "main": "exact commit from selected release version.buildinfo",
+    "official_feeds": "exact commits from the same release feeds.buildinfo",
+    "vendor": "local snapshots required; updated only by manual Vendor Sync",
+    "snapshot_allowed": false
+  },
+  "led_policy": {
+    "controller": "aw1000-5g-role-led for *:5g; patched ledstatus for other LEDs",
+    "failure_samples": 3,
+    "recovery_samples": 2,
+    "stale_after_seconds": 120,
+    "colors": {
+      "unavailable": "off",
+      "standby": "blue",
+      "transition": "yellow",
+      "active": "green",
+      "error": "red"
+    },
+    "status_write": "atomic",
+    "count_only_new_samples": true
+  },
+  "validation": {
+    "local_regression_tests": 12,
+    "upstream_kconfig_version_gate": "passed",
+    "upstream_led_writer_conflict": "passed",
+    "source_revision_stamp": "passed; getver.sh returns exact official version.buildinfo revision",
+    "full_firmware_build": "build step passed in GitHub Actions run 35515202960; old post-build revision check then failed before artifact collection",
+    "aw1000_hardware": "not_run",
+    "online_resolver_explicit_and_auto": "passed; both resolved 25.12.2 on 2026-09-20"
+  },
+  "delivery": {
+    "type": "web-upload-friendly-complete-github-actions-build-repository-with-vendor-archive",
+    "vendor_files": 1051,
+    "vendor_storage": "vendor/vendor-sources.tar.gz with VENDOR_ARCHIVE.sha256",
+    "vendor_archive_bytes": 12934628,
+    "vendor_archive_sha256": "67e70fc71c23c652f89e7053276604b61bf876dc85eaa8c98bb2c50fcd476ddd",
+    "repository_files": 46,
+    "repository_file_count_below_100": true,
+    "vendor_sync_required_before_first_build": false,
+    "upstream_base_and_toolchain": "downloaded automatically by the build workflow"
+  },
+  "vendor_snapshots": [
+    {
+      "name": "QModem",
+      "commit": "c49654efc870f53712ee8e25bf181722eb1466d9",
+      "url": "https://github.com/FUjr/QModem.git",
+      "files": 776
+    },
+    {
+      "name": "luci-theme-argon",
+      "commit": "182294b07f985088b40610f80ec867fe167e41db",
+      "url": "https://github.com/jerrykuku/luci-theme-argon.git",
+      "files": 57
+    },
+    {
+      "name": "luci-app-aw1k-led",
+      "commit": "a8e3537366d74958fbc31046a762769918a4651f",
+      "url": "https://github.com/nooblk-98/luci-app-aw1k-led.git",
+      "files": 17
+    },
+    {
+      "name": "luci-app-openclash",
+      "commit": "c3a33c1d3407956fdf8f0e0b7c1a4c52e6ad9593",
+      "url": "https://github.com/vernesong/OpenClash.git",
+      "files": 201
+    }
+  ]
+}

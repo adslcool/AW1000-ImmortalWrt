@@ -1,0 +1,10 @@
+#!/bin/sh
+# Keep route priorities consistent immediately after netifd/QModem interface
+# changes. This prevents a freshly restored wired default route from becoming
+# primary before the configured recovery hysteresis has completed.
+case "$ACTION" in
+    ifup|ifdown|update|ifupdate|connected|disconnected)
+        /usr/sbin/aw1000-failover enforce >/dev/null 2>&1 || true
+        ;;
+esac
+exit 0
