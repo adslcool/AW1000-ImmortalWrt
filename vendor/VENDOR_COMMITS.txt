@@ -1,5 +1,6 @@
-# Actual third-party source snapshots bundled on 2026-09-20
-# Normal Build uses these local snapshots. Manual Vendor Sync updates them.
+# Third-party source snapshots
+# Updated by .github/workflows/vendor-sync.yml
+# Normal Build uses these repository-local snapshots first.
 
 QModem                   c49654efc870f53712ee8e25bf181722eb1466d9 https://github.com/FUjr/QModem.git
 luci-theme-argon         182294b07f985088b40610f80ec867fe167e41db https://github.com/jerrykuku/luci-theme-argon.git
